@@ -1,27 +1,29 @@
 <#
     .NOTES
         Author: Mark McGill, VMware
-        Last Edit: 7/11/2022
-        Version 1.0.0.0
+        Last Edit: 2/27/2023
+        Version 1.0.6
     .SYNOPSIS
-        Retrieves license information from VMware products
-    .DESCRIPTION
-        Queries VMware Products for license details and returns values listed in the $columns variable
+        Retrieves Certificate information from VMware products
+    .SYNTAX
+        Get-VMwareCertificates -Type <product> -Server <fqdn> -User <username> -Password <password>
     .EXAMPLE
- 
-    .OUTPUTS
-        Object containing vCenter,Cluster,Host and VM information, as well as optimal vCPU recommendations
+        Get-VMwareCertificates -Type vCenter -Server "vcsa-01a.corp.local" -User "administrator@vsphere.local" -Password "VMware1!"
+        # The URL type can be used to retrieve certificates from any URL. Port is optional, and username and password are not needed
+        Get-VMwareCertificates -Type URL -Server "www.vmware.com" 
+        Get-VMwareCertificates -Type URL -Server "www.mydomain.com" -Port 4443
 #>
-function Get-VMwareCertificates
+Function Get-VMwareCertificates
 {
-    #Requires -Version 5.0
+    #Requires -Version 6.0
     [cmdletbinding()]
     Param
     (
-        [Parameter(Mandatory=$true)][ValidateSet("vCenter","Horizon","LogInsight","NSX","vRA","vROps")]$type,
+        [Parameter(Mandatory=$true)][ValidateSet("vCenter","Horizon","LogInsight","NSX","vRA","vROps","URL")]$type,
         [Parameter(Mandatory=$true)]$server,
-        [Parameter(Mandatory=$true)]$user,
-        [Parameter(Mandatory=$true)]$password
+        [Parameter(Mandatory=$false)]$User,
+        [Parameter(Mandatory=$false)]$Password,
+        [Parameter(Mandatory=$false)]$Port #only needed for the URL type
     )
 
     $na = "N/A"
@@ -59,7 +61,7 @@ function Get-VMwareCertificates
         }
     }
 
-    function Get-VCSACertificates
+    Function Get-VCSACertificates
     {
         [cmdletbinding()]
         Param
@@ -114,39 +116,36 @@ function Get-VMwareCertificates
                 $uriTls = "https://$vcenter/rest/vcenter/certificate-management/vcenter/tls"
                 try 
                 {
-                    $sessionId = (Invoke-RestMethod -Uri $uriAuth -Method Post -Headers $headersAuth -SkipCertificateCheck -ErrorAction Stop).Value
-                    $tlsHeaders = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
-                    $tlsHeaders.Add("vmware-api-session-id", "$sessionId")
-                    $machineCert = (Invoke-RestMethod -Uri $uriTls -Method Get -Headers $tlsHeaders -SkipCertificateCheck -ErrorAction Stop).Value
-                    Write-Verbose "Successfully queried $vcenter API"
-                }
-                #catch to skip certificate errors in Powershell 5.x
-                Catch [System.Management.Automation.RuntimeException]
-                {
-                    add-type @"
-                    using System.Net;
-                    using System.Security.Cryptography.X509Certificates;
-                    public class TrustAllCertsPolicy : ICertificatePolicy {
-                        public bool CheckValidationResult(
-                            ServicePoint srvPoint, X509Certificate certificate,
-                            WebRequest request, int certificateProblem) {
-                            return true;
-                        }
+                    If($PSEdition -eq "Core")
+                    {
+                        $sessionId = (Invoke-RestMethod -Uri $uriAuth -Method Post -Headers $headersAuth -SkipCertificateCheck -ErrorAction Stop).Value
+                        $tlsHeaders = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+                        $tlsHeaders.Add("vmware-api-session-id", "$sessionId")
+                        $machineCert = (Invoke-RestMethod -Uri $uriTls -Method Get -Headers $tlsHeaders -SkipCertificateCheck -ErrorAction Stop).Value
+                        Write-Verbose "Successfully queried $vcenter API"
                     }
+                    #accounts for Powershell version 5
+                    elseif ($PSEdition -eq "Desktop") 
+                    {
+                        add-type @"
+                        using System.Net;
+                        using System.Security.Cryptography.X509Certificates;
+                        public class TrustAllCertsPolicy : ICertificatePolicy {
+                            public bool CheckValidationResult(
+                                ServicePoint srvPoint, X509Certificate certificate,
+                                WebRequest request, int certificateProblem) {
+                                return true;
+                            }
+                        }
 "@
-                    [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
-                    $sessionId = (Invoke-RestMethod -Uri $uriAuth -Method Post -Headers $headersAuth -ErrorAction Stop).Value
-                    $tlsHeaders = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
-                    $tlsHeaders.Add("vmware-api-session-id", "$sessionId")
-                    $machineCert = (Invoke-RestMethod -Uri $uriTls -Method Get -Headers $tlsHeaders -ErrorAction Stop).Value
-                    Write-Verbose "Successfully queried $vcenter API 5"
-                }
-                Catch
-                {
-                    Throw "Error querying $vcenter API: $($_.Exception.Message)"
-                }
-                Finally
-                {
+                        [System.Net.ServicePointManager]::CertificatePolicy = New-Object TrustAllCertsPolicy
+                        $sessionId = (Invoke-RestMethod -Uri $uriAuth -Method Post -Headers $headersAuth -ErrorAction Stop).Value
+                        $tlsHeaders = New-Object "System.Collections.Generic.Dictionary[[String],[String]]"
+                        $tlsHeaders.Add("vmware-api-session-id", "$sessionId")
+                        $machineCert = (Invoke-RestMethod -Uri $uriTls -Method Get -Headers $tlsHeaders -ErrorAction Stop).Value
+                        Write-Verbose "Successfully queried $vcenter API 5"
+                    }
+
                     $certificate = "" | Select $columns
                     $certificate.Server = $vcenter
                     $certificate.Type = "vCenter MACHINE_CERT"
@@ -156,8 +155,20 @@ function Get-VMwareCertificates
                     $certificate.IssuedBy = $machineCert.issuer_dn
                     $certificate.ValidFrom = $machineCert.valid_from
                     $certificate.ValidTo = $machineCert.valid_to
-                    $certificates += $certificate
                 }
+                Catch
+                {
+                    If ($_.Exception.Message -match "Response status code does not indicate success")
+                    {
+                        $certificate = Get-CertificateInformation $vcenter 443 "vCenter MACHINE_CERT"
+                    }
+                    else 
+                    {
+                        Throw "Error querying $vcenter API: $($_.Exception.Message)"
+                    }
+                }
+                
+                $certificates += $certificate
     
                 #retrieve certificate information from ldap
                 [System.Reflection.Assembly]::LoadWithPartialName("System.DirectoryServices.Protocols") | Out-Null
@@ -339,7 +350,9 @@ function Get-VMwareCertificates
                 $details.IssuedTo = $certificate.issuedTo
                 $details.IssuedBy = $certificate.issuedBy
                 $details.ValidFrom = $na
-                $details.ValidTo = $certificate.expires
+                #accounts for date returned not being a valid System.DateTime format
+                $validTo = ($certificate.expires).Split(" ")
+                $details.ValidTo = "$($validTo[0]), $($validTo[1]) $($validTo[2]), $($validTo[5]), $($validTo[3])"
                 $certificateDetails += $details
             }
             $ErrorActionPreference = "Continue"
@@ -383,8 +396,11 @@ function Get-VMwareCertificates
                 $details.Thumbprint = $na
                 $details.IssuedTo = $certificate.owner.commonName
                 $details.IssuedBy = $certificate.owner.issuer
-                $details.ValidFrom = $certificate.validityPeriod.from
-                $details.ValidTo = $certificate.validityPeriod.to
+                #accounts for date returned not being a valid System.DateTime format
+                $validFrom = ($certificate.validityPeriod.from).Split(" ")
+                $details.ValidFrom = "$($validFrom[0]), $($validFrom[1]) $($validFrom[2]), $($validFrom[5]), $($validFrom[3])"
+                $validTo = ($certificate.validityPeriod.until).Split(" ")
+                $details.ValidTo = "$($validTo[0]), $($validTo[1]) $($validTo[2]), $($validTo[5]), $($validTo[3])"
                 $certificateDetails += $details
             }
             $ErrorActionPreference = "Continue"
@@ -403,7 +419,7 @@ function Get-VMwareCertificates
         #uses plink to ssh to vRA server since it no longer can retrieve license info via API
         Try
         {
-            $vraResponse = plink -load $username@$fqdn -no-antispoof "vracli certificate ingress --list"
+            $vraResponse = plink -load $fqdn -no-antispoof "vracli certificate ingress --list"
             If ($vraResponse -notcontains "-----BEGIN CERTIFICATE-----")
             {
                 Throw "ERROR retrieving vRA certificates from $fqdn. Command did not return a certificate. Line $($_.InvocationInfo.ScriptLineNumber)"
@@ -444,7 +460,7 @@ function Get-VMwareCertificates
             $secPassword = ConvertTo-SecureString $password -AsPlainText -Force
             $creds = New-Object System.Management.Automation.PSCredential ($userName,$secPassword)
             $response = Invoke-RestMethod -uri $certificateUri -Authentication Basic -SkipCertificateCheck -Credential $creds -Method GET
-            $certificates = $response.results.pem_encoded
+            $certificates = $response.results.pem_encoded | Where  {$_ -notmatch "PRIVATE KEY"}
             $certificateDetails = @()
             foreach ($certificate in $certificates)
             {
@@ -476,7 +492,7 @@ function Get-VMwareCertificates
         $ErrorActionPreference = "Stop"
         $baseUri = "https://$fqdn/rest"
         $userName = $userName.Split('@')
-        If ($userName -ne 2)
+        If ($userName.count -ne 2)
         {
             Throw "UserName must be in SPN format (ie, administrator@corp.local)"
         }
@@ -517,7 +533,7 @@ function Get-VMwareCertificates
             Throw "ERROR retrieving Horizon certificates from $fqdn. $($_.Exception.Message). Line $($_.InvocationInfo.ScriptLineNumber)"
         }
     }
-    Function Get-CertificateInformation ($fqdn,$port,$type)
+    Function Get-CertificateInformation($fqdn,$port)
     {
         #not currently in use
         #used to query a url directly for certificate info if it can't be done via API or other method
@@ -552,9 +568,10 @@ function Get-VMwareCertificates
             }
                 $details = "" | Select $columns       
                 $details.Server = $fqdn
-                $details.Type = $type
+                $details.Type = "URL"
+                $details.Subject = $certificate.Subject
                 $details.Thumbprint = $certificate.Thumbprint
-                $details.IssuedTo = $certificate.Issuer
+                $details.IssuedTo = $fqdn
                 $details.IssuedBy = $certificate.Issuer
                 $details.ValidFrom = $certificate.NotBefore
                 $details.ValidTo =$certificate.NotAfter
@@ -573,13 +590,14 @@ function Get-VMwareCertificates
         {
             $results = Get-VCSACertificates -vCenter $server -user $user -password $password -includeHosts -all
         }
-            "LogInsight" 
+        "LogInsight" 
         {
             $results = Get-LogInsightCertificates $server $user $password
         }
         "Horizon"
         {
             $results = Get-HorizonCertificates $server $user $password
+            #Needs to be Horizon v7.10 or higher, or you need to use the "URL" option to retrieve the certificate
         }
         "NSX" 
         {
@@ -592,6 +610,10 @@ function Get-VMwareCertificates
         "vROps" 
         {
             $results = Get-vROPsCertificates $server $user $password
+        }
+        "URL"
+        {
+            $results = Get-CertificateInformation $server $port
         }
     }
     Return $results
